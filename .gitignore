@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.env
+venv/
+.DS_Store
+data/*.csv  # If you don't want to commit output data directly
+# Add any other files or directories you don't want in version control
