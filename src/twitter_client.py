@@ -1,148 +1,133 @@
-import tweepy
-import os
-from dotenv import load_dotenv # For loading .env file if not using Codespaces secrets directly
+# File Navigation Location: bahrain_airport_analyzer/src/main.py
 
-# Load environment variables if an .env file is present (for local dev)
+import os
+import pandas as pd
+from dotenv import load_dotenv
+from twitter_client import TwitterClient # Assuming twitter_client.py is in the same src directory
+from gemini_analyzer import GeminiAnalyzer # Assuming gemini_analyzer.py is in the same src directory
+
+# Load environment variables from .env.example or Codespaces secrets
 load_dotenv()
 
-# It's best practice to get secrets from environment variables,
-# which GitHub Codespaces populates from its secrets store.
-TWITTER_BEARER_TOKEN = os.environ.get("TWITTER_BEARER_TOKEN")
+# Configuration
+# Ensure these defaults are 10 to comply with Twitter API min limits for max_results
+# and to minimize API calls for testing.
+TWITTER_SEARCH_QUERY = os.environ.get('TWITTER_QUERY', '@GulfAir -is:retweet') # Your desired query
+MAX_MENTIONS_TO_FETCH = int(os.environ.get('MAX_MENTIONS_TO_FETCH', 10))
+MAX_COMMENTS_PER_MENTION = int(os.environ.get('MAX_COMMENTS_PER_MENTION', 10))
+OUTPUT_CSV_FILE = "data/bahrain_airport_comment_sentiments.csv" # Output file path
 
-if not TWITTER_BEARER_TOKEN:
-    print("Error: TWITTER_BEARER_TOKEN not found in environment variables.")
-    # You might want to raise an exception here or handle it more gracefully
-    # For now, we'll let it proceed and tweepy will likely fail if it's None
+def run_analysis():
+    print("Starting Twitter mention and sentiment analysis...")
 
-class TwitterClient:
-    def __init__(self):
-        if not TWITTER_BEARER_TOKEN:
-            raise ValueError("Twitter Bearer Token not configured.")
-        self.client = tweepy.Client(bearer_token=TWITTER_BEARER_TOKEN)
+    try:
+        twitter = TwitterClient()
+        gemini = GeminiAnalyzer()
+    except ValueError as e:
+        print(f"Error initializing clients: {e}")
+        return
+    except Exception as e: # Catch any other unexpected error during initialization
+        print(f"An unexpected error occurred during client initialization: {e}")
+        return
 
-    def get_mentions(self, query, max_results=10):
-        """
-        Fetches recent tweets mentioning the specified query.
-        """
-        if not self.client:
-            print("Twitter client not initialized.")
-            return []
-        try:
-            print(f"Searching for mentions with query: {query}")
-            response = self.client.search_recent_tweets(
-                query=query,
-                tweet_fields=['id', 'text', 'created_at', 'author_id', 'conversation_id', 'in_reply_to_user_id'],
-                expansions=['author_id'], # To get user details like username
-                user_fields=['username'],
-                max_results=max_results
+    # Ensure MAX_MENTIONS_TO_FETCH is at least 10 for the API call
+    # The twitter_client.py now also has a safeguard for this.
+    actual_max_mentions = max(10, MAX_MENTIONS_TO_FETCH) 
+    
+    print(f"Fetching up to {actual_max_mentions} mentions for query: {TWITTER_SEARCH_QUERY}")
+    # This will be 1 API call to Twitter
+    mentions = twitter.get_mentions(query=TWITTER_SEARCH_QUERY, max_results=actual_max_mentions)
+
+    if not mentions:
+        print("No mentions found. Exiting.")
+        return
+
+    all_analyzed_comments = []
+    processed_one_mention_for_comments = False # Flag to ensure we only get comments for one mention
+
+    print(f"\n--- Found {len(mentions)} mentions. Processing comments for the first valid one only. ---")
+
+    for mention_index, mention in enumerate(mentions):
+        # We will process all found mentions for their text, but only get comments for the first one.
+        print(f"\nMention ({mention_index + 1}/{len(mentions)}): Tweet ID: {mention.id} | Text: {mention.text}")
+
+        if not processed_one_mention_for_comments:
+            if not mention.author_id:
+                print(f"  Skipping comment retrieval for mention {mention.id} due to missing author_id.")
+                # We might still want to process the next mention for comments if this one fails
+                # Or, if you strictly want to try only the very first mention encountered:
+                # processed_one_mention_for_comments = True # Mark as processed even if skipped
+                continue # Try the next mention for comments if this one has no author_id
+
+            # Ensure MAX_COMMENTS_PER_MENTION is at least 10 for the API call
+            # The twitter_client.py now also has a safeguard for this.
+            actual_max_comments = max(10, MAX_COMMENTS_PER_MENTION)
+
+            print(f"  Attempting to fetch up to {actual_max_comments} comments for this mention (Tweet ID: {mention.id})...")
+            # This will be 1 API call to Twitter (for this first processed mention)
+            comments = twitter.get_comments_on_tweet(
+                tweet_id=mention.id,
+                conversation_id=mention.conversation_id,
+                original_tweet_author_id=mention.author_id,
+                max_results=actual_max_comments
             )
-            # print(f"Twitter API Response: {response}") # For debugging
 
-            mentioning_tweets = response.data
-            if not mentioning_tweets:
-                print("No recent mentions found.")
-                return []
-            return mentioning_tweets
-        except tweepy.TweepyException as e:
-            print(f"Error searching tweets: {e}")
-            if response and response.errors:
-                print(f"API Errors: {response.errors}")
-            return []
-        except Exception as e:
-            print(f"An unexpected error occurred while fetching mentions: {e}")
-            return []
-
-    def get_comments_on_tweet(self, tweet_id, conversation_id, original_tweet_author_id, company_twitter_id=None, max_results=20):
-        """
-        Fetches replies (comments) to a specific tweet, trying to focus on relevant replies.
-        `original_tweet_author_id` is the author of the tweet that contained the mention.
-        `company_twitter_id` (string) is the user ID of the company account, if you want to filter replies
-        specifically to the company if the company itself made the original tweet.
-        """
-        if not self.client:
-            print("Twitter client not initialized.")
-            return []
-        try:
-            # Query for replies within the same conversation, not by the original tweet author
-            # and ensuring they are replies (have 'in_reply_to_user_id')
-            # Note: `is:reply` doesn't always work as expected in standard search for recent tweets.
-            # Focusing on conversation_id and ensuring in_reply_to_user_id is present is more robust.
-            reply_query = f"conversation_id:{conversation_id} -from:{original_tweet_author_id}"
-
-            # If the original tweet was by the company, you might only want replies to that specific tweet.
-            # If the mention was by someone else, you want replies to *their* tweet.
-            # A more precise way to get direct replies to `tweet_id`:
-            # reply_query = f"in_reply_to_tweet_id:{tweet_id} -is:retweet"
-            # However, `in_reply_to_tweet_id` is a v1.1 operator primarily.
-            # For v2, `conversation_id` is key. We then filter.
-
-            print(f"Searching for comments with query: {reply_query} for tweet_id: {tweet_id}")
-
-            response = self.client.search_recent_tweets(
-                query=reply_query,
-                tweet_fields=['id', 'text', 'created_at', 'author_id', 'in_reply_to_user_id', 'conversation_id'],
-                expansions=['author_id'],
-                user_fields=['username'],
-                max_results=max_results
-            )
-            # print(f"Twitter API Response (Comments): {response}") # For debugging
-
-            all_replies_in_conversation = response.data
-            comments_on_specific_tweet = []
-
-            if all_replies_in_conversation:
-                for reply in all_replies_in_conversation:
-                    # This is a crucial filtering step:
-                    # We want replies *to the tweet that contained the mention* (tweet_id)
-                    # or, if the mention *is* the original tweet of the conversation,
-                    # any reply in that conversation (excluding replies to other replies further down the chain, if desired).
-                    # For simplicity here, we're taking replies within the conversation.
-                    # A more robust check would be `if reply.in_reply_to_user_id == original_tweet_author_id`
-                    # AND potentially `reply.referenced_tweets` contains a reference to `tweet_id`
-                    # However, `referenced_tweets` might not be directly available in `tweet_fields` for search.
-                    # We need to check if `in_reply_to_user_id` on the reply matches the `author_id` of the tweet_id we are interested in.
-
-                    # Let's assume any reply in the conversation not by the original author is a "comment"
-                    # A more precise filter could be to ensure reply.in_reply_to_tweet_id (if available via different endpoint/expansion)
-                    # or checking the conversation structure.
-                    # For now, this is a broader catch within the conversation.
-                    if reply.id != tweet_id: # Make sure it's not the original tweet itself
-                         comments_on_specific_tweet.append(reply)
-
-            if comments_on_specific_tweet:
-                print(f"  Found {len(comments_on_specific_tweet)} potential comments for tweet {tweet_id}.")
-            else:
-                print(f"  No direct comments found for tweet {tweet_id} with the current filtering.")
-            return comments_on_specific_tweet
-
-        except tweepy.TweepyException as e:
-            print(f"  Error fetching comments for tweet {tweet_id}: {e}")
-            if response and response.errors:
-                print(f"  API Errors: {response.errors}")
-            return []
-        except Exception as e:
-            print(f"  An unexpected error occurred while fetching comments: {e}")
-            return []
-
-if __name__ == '__main__':
-    # Example Usage (for testing this module directly)
-    # Ensure TWITTER_BEARER_TOKEN is set in your environment or .env file
-    client = TwitterClient()
-    # Replace with the actual Twitter handle or name for Bahrain Airport Company
-    # And potentially get their user ID for more precise filtering if needed.
-    # For example, you might want to look up "@BAC_Bahrain" user ID first.
-    test_query = '"Bahrain Airport Company" OR @BAC_Bahrain -is:retweet'
-    mentions = client.get_mentions(query=test_query, max_results=5)
-
-    if mentions:
-        for mention in mentions:
-            print(f"\nMention Tweet ID: {mention.id} by Author ID: {mention.author_id} | Text: {mention.text}")
-            # Pass the author_id of the tweet that *contained* the mention
-            comments = client.get_comments_on_tweet(mention.id, mention.conversation_id, mention.author_id, max_results=5)
             if comments:
-                for comment in comments:
-                    print(f"    Comment ID: {comment.id} | Author ID: {comment.author_id} | Text: {comment.text}")
+                print(f"    Found {len(comments)} comments for mention {mention.id}.")
+                for comment_index, comment in enumerate(comments):
+                    print(f"      Analyzing Comment ({comment_index + 1}/{len(comments)}) ID: {comment.id} | Text: {comment.text}")
+                    sentiment = gemini.analyze_sentiment(comment.text)
+                    print(f"      Sentiment: {sentiment}")
+                    all_analyzed_comments.append({
+                        "mention_tweet_id": mention.id,
+                        "mention_tweet_text": mention.text,
+                        "comment_id": comment.id,
+                        "comment_text": comment.text,
+                        "comment_author_id": comment.author_id,
+                        "comment_created_at": comment.created_at,
+                        "sentiment": sentiment
+                    })
             else:
-                print("    No comments retrieved for this mention.")
+                print(f"    No comments found or retrieved for mention {mention.id}.")
+            
+            processed_one_mention_for_comments = True # Set the flag so we don't get comments for subsequent mentions
+            # If you strictly only want to attempt comment retrieval for the VERY first mention,
+            # and then stop processing further mentions entirely, you can add 'break' here.
+            # For now, it will print info for other mentions but not fetch their comments.
+            # To stop after the first mention entirely (no further mention printing):
+            # break
+
+    if all_analyzed_comments:
+        # Ensure the 'data' directory exists
+        data_dir = "data"
+        if not os.path.exists(data_dir):
+            try:
+                os.makedirs(data_dir)
+                print(f"Created directory: {data_dir}")
+            except OSError as e:
+                print(f"Error creating directory {data_dir}: {e}")
+                # Fallback or decide how to handle if dir creation fails
+        
+        if os.path.exists(data_dir):
+            df = pd.DataFrame(all_analyzed_comments)
+            try:
+                df.to_csv(OUTPUT_CSV_FILE, index=False, encoding='utf-8')
+                print(f"\nAnalysis complete. Results for comments saved to {OUTPUT_CSV_FILE}")
+                print("First few rows of the saved data:")
+                print(df.head())
+            except IOError as e:
+                print(f"Error saving results to CSV {OUTPUT_CSV_FILE}: {e}")
+                print("\nDisplaying results in console instead:")
+                print(df)
+        else:
+            print(f"Could not create or find data directory '{data_dir}'. Results not saved to CSV.")
+            if all_analyzed_comments:
+                 df = pd.DataFrame(all_analyzed_comments)
+                 print("\nDisplaying results in console:")
+                 print(df)
+
     else:
-        print("No mentions found to test comment retrieval.")
+        print("\nNo comments were analyzed or no mentions led to comment analysis.")
+
+if __name__ == "__main__":
+    run_analysis()
