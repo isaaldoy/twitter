@@ -1,0 +1,14 @@
+{
+  "name": "Python 3",
+  // Use the official Python 3 image.
+  "image": "mcr.microsoft.com/devcontainers/python:3",
+
+  // Add an VS Code extension
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python"
+      ]
+    }
+  }
+}

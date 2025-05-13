@@ -9,7 +9,7 @@ load_dotenv()
 
 # Configuration (can be moved to a config file or set via environment variables)
 # Get from .env.example or set directly if not in env
-TWITTER_SEARCH_QUERY = os.environ.get('TWITTER_QUERY', '"Bahrain Airport Company" OR @BAC_Bahrain -is:retweet')
+TWITTER_SEARCH_QUERY = os.environ.get('TWITTER_QUERY', '@GulfAir -is:retweet')
 MAX_MENTIONS_TO_FETCH = int(os.environ.get('MAX_MENTIONS_TO_FETCH', 5)) # Be mindful of API limits
 MAX_COMMENTS_PER_MENTION = int(os.environ.get('MAX_COMMENTS_PER_MENTION', 10)) # Be mindful of API limits
 OUTPUT_CSV_FILE = "data/bahrain_airport_comment_sentiments.csv"
